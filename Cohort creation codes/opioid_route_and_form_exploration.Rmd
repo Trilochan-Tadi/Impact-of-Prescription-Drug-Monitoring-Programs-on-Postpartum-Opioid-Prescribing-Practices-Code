@@ -1,0 +1,209 @@
+---
+title: "opioid_route_and_form_exploration"
+author: "Sai"
+date: "2024-11-18"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libaries
+
+```{r}
+library(data.table)
+library(dplyr)
+
+```
+
+
+
+### opiod route and form exploration 
+
+```{r}
+
+cohort_file_path <-"Z:/chelsea/datalake/New_cohort/New_filters/cohort_opioid2.csv"
+lookup_file_path <- "Z:/lookup/pp_rx_lookup.csv"
+
+# Load the cohort data and lookup data
+cohort_data <- read.csv(cohort_file_path, stringsAsFactors = FALSE)
+pprx_lookup <- read.csv(lookup_file_path, stringsAsFactors = FALSE)
+
+# Ensure the relevant columns are of the same type
+cohort_data$presc_opioid <- as.character(cohort_data$presc_opioid)
+pprx_lookup$ndc <- as.character(pprx_lookup$ndc)
+
+# Rename the column in the lookup file to match `presc_opioid`
+pprx_lookup <- pprx_lookup %>%
+  rename(presc_opioid = ndc)
+
+# Merge the cohort data with the lookup file to get dosage_form and route
+cohort_data <- cohort_data %>%
+  left_join(pprx_lookup %>% select(presc_opioid, dosage_form_nm, route), by = "presc_opioid")
+
+# Display the first few rows to verify the merge
+head(cohort_data)
+```
+
+
+```{r}
+library(tidyr)
+
+split_strength <- function(strength_full) {
+  # Split the strength string into components
+  strength_values <- strsplit(as.character(strength_full), "[^0-9\\.]+")[[1]]
+  
+  # Remove empty strings and convert to numeric
+  strength_values <- as.numeric(strength_values[strength_values != ""])
+  
+  # Sort the values in ascending order
+  strength_values <- sort(strength_values, na.last = TRUE)
+  
+  # Assign smaller value to strength_op and larger to strength_no_op
+  if (length(strength_values) > 1) {
+    strength_op <- strength_values[1]  # Smaller value
+    strength_no_op <- strength_values[length(strength_values)]  # Larger value
+  } else if (length(strength_values) == 1) {
+    strength_op <- strength_values[1]  # Single value
+    strength_no_op <- NA  # No larger value
+  } else {
+    strength_op <- NA
+    strength_no_op <- NA
+  }
+  
+  return(c(strength_op = strength_op, strength_no_op = strength_no_op))
+}
+
+# Apply the function to the dataset
+cohort_data <- cohort_data %>%
+  rowwise() %>%
+  mutate(
+    # Apply function to split strength and extract values
+    strength_split = list(split_strength(Strength)),
+    strength_op = strength_split[["strength_op"]],
+    strength_no_op = strength_split[["strength_no_op"]]
+  ) %>%
+  ungroup() %>%
+  select(-strength_split)  # Remove intermediate column
+
+# View the updated data
+View(cohort_data)
+
+
+```
+
+
+```{r}
+fix_specific_cases <- function(strength_full) {
+  # Check for patterns like "MCG/ML" or "MG/ML" and extract the first numeric value
+  if (grepl("MCG|MG", strength_full)) {
+    # Extract all numeric values from the string
+    strength_values <- as.numeric(unlist(strsplit(gsub("[^0-9\\.]", " ", strength_full), "\\s+")))
+    
+    # Set `strength_op` as the first numeric value and ignore others
+    strength_op <- ifelse(length(strength_values) >= 1, strength_values[1], NA)
+    strength_no_op <- ifelse(length(strength_values) > 1, max(strength_values), NA)
+  } else {
+    # For other cases, leave as NA
+    strength_op <- NA
+    strength_no_op <- NA
+  }
+  
+  return(c(strength_op = strength_op, strength_no_op = strength_no_op))
+}
+
+# Apply the function to only rows matching specific cases
+cohort_data <- cohort_data %>%
+  rowwise() %>%
+  mutate(
+    # Apply function only for rows with patterns like "MCG/ML" or "MG/ML"
+    case_match = grepl("MCG/|MG/", Strength),
+    strength_split = if (case_match) list(fix_specific_cases(Strength)) else list(c(strength_op = strength_op, strength_no_op = strength_no_op)),
+    strength_op = strength_split[["strength_op"]],
+    strength_no_op = strength_split[["strength_no_op"]]
+  ) %>%
+  ungroup() %>%
+  select(-strength_split, -case_match)  # Remove intermediate columns
+
+# View the updated dataset
+View(cohort_data)
+```
+
+
+
+
+`
+```{r}
+cohort_data <- cohort_data%>%
+  mutate(
+    mme =(strength_op * op_quan / op_dayssup) * MME_Conversion_Factor
+  )
+View(cohort_data)
+```
+
+
+HYDROMORPHONE 
+
+```{r}
+extract_opioid <- function(generic_name) {
+  # Define a list of known opioid names
+  opioids <- c("oxycodone", "codeine", "hydrocodone", "fentanyl", "morphine", "tramadol","hydromorphone")
+  
+  # Convert the generic name to lowercase for pattern matching
+  generic_name <- tolower(generic_name)
+  
+  # Search for any known opioid in the generic name
+  matched_opioid <- opioids[sapply(opioids, function(opioid) grepl(opioid, generic_name))]
+  
+  # Return the first match if found, otherwise NA
+  if (length(matched_opioid) > 0) {
+    return(matched_opioid[1])
+  } else {
+    return(NA)
+  }
+}
+
+# Apply the function to the GenericName column to create the generic_name_op column
+cohort_data <- cohort_data %>%
+  mutate(generic_name_op = sapply(GenericName, extract_opioid))
+
+# View the updated dataset
+View(cohort_data)
+
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Summarize the data: count unique patients for each opioid
+opioid_distribution <- cohort_data %>%
+  filter(!is.na(generic_name_op)) %>%  # Exclude NA values in generic_name_op
+  group_by(generic_name_op) %>%
+  summarise(patient_count = n_distinct(pat_id_p)) %>%
+  arrange(desc(patient_count))
+
+# Display the table
+cat("Table of opioid distribution:\n")
+print(opioid_distribution)
+
+# Plot a bar graph
+ggplot(opioid_distribution, aes(x = reorder(generic_name_op, -patient_count), y = patient_count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Distribution of Opioid Usage by Patients",
+       x = "Opioid (Generic Name)",
+       y = "Number of Unique Patients") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+```{r}
+cohort_data %>%
+  filter(!is.na(type_of_delivery)) %>%
+  distinct(pat_id_p, type_of_delivery) %>%
+  count(type_of_delivery)
+```
+
+
