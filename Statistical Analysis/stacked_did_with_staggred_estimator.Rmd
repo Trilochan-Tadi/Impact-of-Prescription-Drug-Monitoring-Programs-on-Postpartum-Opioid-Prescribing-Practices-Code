@@ -1,0 +1,781 @@
+---
+title: "Untitled"
+author: "Sai"
+date: "2025-08-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load required packages
+library(tidyverse)
+library(lubridate)
+library(dplyr)
+library(haven)
+library(ggplot2)
+library(fixest)
+library(broom)
+library(data.table)
+library(did)
+```
+
+```{r}
+data <- fread("Z:/chelsea/datalake/New_cohort/New_filters/final_cohort_ins2.csv")# pat_id_P: 119164, Pat_id-p is a unique identifier for each pregnancy episode of the patient
+ dates <- fread("Z:/chelsea/datalake/final_codes/PDMPs_table.csv")
+```
+
+```{r}
+data <- data %>%
+  mutate(
+    opioid_dates = ymd(opioid_dates),
+    delivery_dt = ymd(delivery_dt)
+  )
+```
+
+```{r}
+data <- data %>%
+  distinct(pat_id_p, opioid_dates, op_dayssup, op_quan, 
+           presc_opioid, generic_name_op, pat_state,mme, .keep_all = TRUE)
+
+cat("Original data:", nrow(data), "rows\n")
+
+```
+
+```{r}
+## removing the neagtive, missing,zero/nan/ values larger than 999 days days supply 
+data <- data %>%
+  filter(!is.na(op_dayssup),
+         op_dayssup > 0,
+         op_dayssup <= 999)
+## 273,691 obs,pat_id_p: 118405
+```
+
+```{r}
+# Filter data to include only ORAL route and TABLET dosage form
+data <- data %>%
+  filter(route == "ORAL",
+         dosage_form_nm == "TABLET")
+## 269,404 obs, pat_id_p: 117652
+```
+
+
+```{r}
+data <- data %>%
+  filter(opioid_week_ad == "Yes")
+## 110,741 obs, pat_id__p:107931
+```
+
+```{r}
+data <- data %>%
+  filter(!is.na(pat_state) & pat_state != "") ## 108,554, pat_id_p: 105810
+```
+
+```{r}
+# data <- data %>%
+#   mutate(mme = strength_op * op_quan  * MME_Conversion_Factor)
+```
+
+```{r}
+data <- data %>%
+  mutate(mme = (strength_op * op_quan / op_dayssup) * MME_Conversion_Factor)
+```
+
+```{r}
+  # data <- data %>%
+  #   filter(mme!= 0 )
+```
+
+```{r}
+  data <- data %>%
+    filter(mme!= 0 & mme <=90)#97,499 obs, pat_id_p: 95238
+```
+
+# inusrance calssification
+
+```{r}
+data <- data %>%
+  mutate(insurance_group = case_when(
+    pay_type %in% c("M","K") ~ "Medicaid",
+    pay_type %in% c("C") ~ "Commercial",
+    pay_type %in% c("S") ~ "Self",
+    pay_type %in% c("R", "A", "T") ~ "Medicare",
+    pay_type %in% c("U") ~ "Missing",
+    pay_type %in% c( "X") ~ "Rx-only",
+    TRUE ~ "Other"
+  ))
+```
+
+## excluding pateints insurance that are missing and medicare
+
+```{r}
+data <- data %>%
+  filter(!insurance_group %in% c("Medicare","Missing"))#97,098 obs, pat_id_p: 94,8844
+```
+
+
+
+```{r}
+#A Entire Data Cleaning Process
+#1. Keep only necessary variables from the main data
+data_c <- data %>%
+  select(
+    pat_state,
+    pat_id_p,
+    der_yob,
+    opioid_dates,
+    delivery_dt,
+    mme,
+    op_quan,
+    op_dayssup,
+    type_of_delivery,
+    total_pregnancies,
+    insurance_group
+  )
+
+#2 Ensure date columns are properly formatted
+data_c <- data_c %>%
+  mutate(
+    opioid_dates = ymd(opioid_dates),
+    delivery_dt = ymd(delivery_dt)
+  )
+
+#3Check for Missing Data
+data_c <- data_c %>%
+  filter(
+    !is.na(pat_state),
+    !is.na(opioid_dates),
+    !is.na(mme)
+  )
+nrow(data_c)
+
+#4 Create year variable for aggregation
+data_c <- data_c %>%
+  mutate(year = year(opioid_dates))
+
+#5 Formatting date to match
+dates_c <- dates %>%
+  mutate(
+    creation_pdmp = ymd(paste0(str_trim(creation_pdmp), "-01"))
+  ) %>%
+  select(pat_state, creation_pdmp)
+#6 Merging two datasets
+data_m <- data_c %>% 
+  left_join(dates_c, by = "pat_state") 
+
+data_m <- data_m %>%
+  mutate(
+    age_at_delivery = year(opioid_dates) - der_yob,
+    time_to_treat = interval(creation_pdmp, opioid_dates) %/% months(1),
+    treated = ifelse(!is.na(creation_pdmp) & opioid_dates >= creation_pdmp, 1, 0)
+  )
+
+```
+
+```{r}
+#8 Prepare data for Callaway & Sant'Anna
+data_cs <- data_m %>%
+  filter(!is.na(year)) %>%
+  mutate(
+    id = as.numeric(factor(pat_id_p)),
+    G = ifelse(is.na(creation_pdmp), 0, year(creation_pdmp)),
+    T = year,
+    Y_mme = mme,
+    Y_op_quan = op_quan,
+    Y_dayssup = op_dayssup,
+    age = age_at_delivery,
+    delivery = type_of_delivery,
+    pregnancies= total_pregnancies,
+    insurance =insurance_group
+  ) %>%
+  select(id, G, T, pat_state, pat_id_p, age, delivery,Y_mme, Y_op_quan, Y_dayssup,pregnancies,insurance)
+
+# Check the data structure
+head(data_cs)
+summary(data_cs)
+```
+
+```{r}
+# Compare total observations vs unique patients
+total_obs <- nrow(data_cs)
+unique_patients <- length(unique(data_cs$pat_id_p))
+
+cat("Total observations:", total_obs, "\n")
+cat("Unique patients:", unique_patients, "\n")
+cat("Patients with multiple observations:", total_obs - unique_patients, "\n")
+
+if(total_obs > unique_patients) {
+  cat("YES - Patients are repeating\n")
+} else {
+  cat("NO - Each patient appears only once\n")
+}
+```
+
+```{r}
+# Count how many times each patient appears
+patient_counts <- data_cs %>%
+  count(pat_id_p, sort = TRUE)
+
+# Show patients with multiple observations
+repeating_patients <- patient_counts %>%
+  filter(n > 1)
+
+cat("Number of patients with multiple observations:", nrow(repeating_patients), "\n")
+cat("Top 10 patients with most observations:\n")
+print(head(repeating_patients, 10))
+
+# Look at sample of repeating patients' data
+cat("\nSample of repeating patients' data (with all outcomes):\n")
+sample_patients <- head(repeating_patients$pat_id_p, 5)
+
+data_cs %>%
+  filter(pat_id_p %in% sample_patients) %>%
+  arrange(pat_id_p, T) %>%
+  select(
+    pat_id_p, T, G, pat_state, id,
+    Y_mme, Y_op_quan, Y_dayssup
+  ) %>%
+  print(n = 20)
+
+# Summary of how many times patients repeat
+cat("\nDistribution of how many times patients appear:\n")
+repetition_summary <- table(patient_counts$n)
+print(repetition_summary)
+
+# Patients appearing in multiple years
+patient_years <- data_cs %>%
+  group_by(pat_id_p) %>%
+  summarise(
+    years_present = n_distinct(T),
+    min_year = min(T),
+    max_year = max(T),
+    total_obs = n(),
+    observations = paste(T, collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  filter(total_obs > 1)
+
+cat("\nPatients appearing in multiple years:\n")
+print(head(patient_years, 10))
+
+
+```
+
+```{r}
+# Step 1: Aggregate multiple prescriptions per patient to patient level
+data_cs_patient <- data_cs %>%
+  group_by(pat_id_p, pat_state) %>%
+  summarise(
+    # Aggregate outcomes
+    total_mme = sum(Y_mme, na.rm = TRUE),
+    total_op_quan = sum(Y_op_quan, na.rm = TRUE),
+    total_dayssup = sum(Y_dayssup, na.rm = TRUE),
+
+    avg_mme = mean(Y_mme, na.rm = TRUE),
+    avg_op_quan = mean(Y_op_quan, na.rm = TRUE),
+    avg_dayssup = mean(Y_dayssup, na.rm = TRUE),
+
+    num_prescriptions = n(),
+
+    # Keep patient-level covariates
+    G = first(G),
+    T = first(T),
+    age = first(age),
+    delivery_type = first(delivery),  # Just extract the first value here
+    total_preg = first(pregnancies),
+    insurance = first(insurance),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    delivery_type = factor(delivery_type, levels = c("Vaginal", "Cesarean")),  # Now factor it
+    id = as.numeric(factor(pat_id_p)),
+
+    # Create separate columns for modeling
+    Y = total_mme,
+    Y2 = total_op_quan,
+    Y3 = total_dayssup
+  )
+# Step 2: Check the aggregation worked
+cat("Before aggregation - Observations:", nrow(data_cs), "\n")
+cat("After aggregation - Unique patients:", nrow(data_cs_patient), "\n")
+cat("Patients removed by aggregation:", nrow(data_cs) - nrow(data_cs_patient), "\n")
+
+```
+
+##### Stacked DID 
+```{r}
+data_cs_filtered_t <- data_cs_patient %>%
+  filter(T >= 2006 & T <= 2015)
+```
+
+
+```{r}
+cohorts_att <- 2007:2015
+
+d_full <- data_cs_filtered_t %>%
+  filter(
+    T >= 2006, T <= 2015,                      # calendar year restriction
+    G == 0L | G %in% cohorts_att | G > 2014     # keep never-treated, target cohorts, and late adopters
+  )
+
+
+# 1 First we do all work for MME which is turned in "y" which is Total MME per delivery
+#Step 1: Run full model
+att_gt_full_y <- att_gt(
+  yname          = "Y",
+  gname          = "G",        # first treatment year (0=never)
+  idname         = "id",
+  tname          = "T",        # calendar year
+  xformla        = ~ age,
+  data           = d_full,
+  panel          = FALSE,      # repeated cross-sections at patient-year
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+summary(att_gt_full_y)
+
+# Step 2: Event-study style aggregation with a tight window
+dyn_pool_y <- aggte(
+  att_gt_full_y,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3
+)
+summary(dyn_pool_y)
+ggdid(dyn_pool_y)
+
+```
+
+
+##Y2
+```{r}
+# 2 second we do all work for OP Quant which is turned in "y2" col in dataset
+#Step 1: Run full model
+att_gt_full_y2 <- att_gt(
+  yname          = "Y2",
+  gname          = "G",        # first treatment year (0=never)
+  idname         = "id",
+  tname          = "T",        # calendar year
+  xformla        = ~ age,
+  data           = d_full,
+  panel          = FALSE,      # repeated cross-sections at patient-year
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+summary(att_gt_full_y2)
+
+# Step 2. Event-study style aggregation with a tight window
+dyn_pool_y2 <- aggte(
+  att_gt_full_y2,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3
+)
+summary(dyn_pool_y2)
+ggdid(dyn_pool_y2)
+
+```
+
+```{r}
+# 3 Third we do all work for DaySup which is turned in "y3" col in dataset
+#Step 1: Run full model
+att_gt_full_y3 <- att_gt(
+  yname          = "Y3",
+  gname          = "G",        # first treatment year (0=never)
+  idname         = "id",
+  tname          = "T",        # calendar year
+  xformla        = ~ age,
+  data           = d_full,
+  panel          = FALSE,      # repeated cross-sections at patient-year
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+summary(att_gt_full_y3)
+
+# Step 2. Event-study style aggregation with a tight window
+dyn_pool_y3 <- aggte(
+  att_gt_full_y3,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3
+)
+summary(dyn_pool_y3)
+ggdid(dyn_pool_y3)
+
+```
+
+```{r}
+att_df <- tibble(
+  group = att_gt_full_y$group,
+  time = att_gt_full_y$t,
+  att = att_gt_full_y$att
+)
+att_df <- att_df %>%
+  mutate(event_time = time - group)
+event0 <- att_df%>%
+  filter(event_time == 2)
+print(event0)
+```
+
+### senistvivty analysis
+## unadjusted model 
+```{r}
+att_gt_full_y <- att_gt(
+  yname          = "Y",
+  gname          = "G",        # first treatment year (0=never)
+  idname         = "id",
+  tname          = "T",        # calendar year
+  data           = d_full,
+  panel          = FALSE,      # repeated cross-sections at patient-year
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+summary(att_gt_full_y)
+
+# Step 2: Event-study style aggregation with a tight window
+dyn_pool_y <- aggte(
+  att_gt_full_y,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3
+)
+summary(dyn_pool_y)
+```
+#Y2
+```{r}
+att_gt_full_y <- att_gt(
+  yname          = "Y2",
+  gname          = "G",        # first treatment year (0=never)
+  idname         = "id",
+  tname          = "T",        # calendar year
+  data           = d_full,
+  panel          = FALSE,      # repeated cross-sections at patient-year
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+summary(att_gt_full_y)
+
+# Step 2: Event-study style aggregation with a tight window
+dyn_pool_y <- aggte(
+  att_gt_full_y,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3
+)
+summary(dyn_pool_y)
+```
+#Y3
+```{r}
+att_gt_full_y <- att_gt(
+  yname          = "Y3",
+  gname          = "G",        # first treatment year (0=never)
+  idname         = "id",
+  tname          = "T",        # calendar year
+  data           = d_full,
+  panel          = FALSE,      # repeated cross-sections at patient-year
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+summary(att_gt_full_y)
+
+# Step 2: Event-study style aggregation with a tight window
+dyn_pool_y <- aggte(
+  att_gt_full_y,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3
+)
+summary(dyn_pool_y)
+```
+
+### senistvivty analysis 
+#1 Cesearn pateints 
+
+```{r}
+data_cesearn <- data_cs %>%
+  filter(delivery == "Cesarean")
+```
+
+```{r}
+data_cs_patient_ces <- data_cesearn %>%
+  group_by(pat_id_p, pat_state) %>%
+  summarise(
+    # Aggregate outcomes
+    total_mme = sum(Y_mme, na.rm = TRUE),
+    total_op_quan = sum(Y_op_quan, na.rm = TRUE),
+    total_dayssup = sum(Y_dayssup, na.rm = TRUE),
+
+    avg_mme = mean(Y_mme, na.rm = TRUE),
+    avg_op_quan = mean(Y_op_quan, na.rm = TRUE),
+    avg_dayssup = mean(Y_dayssup, na.rm = TRUE),
+
+    num_prescriptions = n(),
+
+    # Keep patient-level covariates
+    G = first(G),
+    T = first(T),
+    age = first(age),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    id = as.numeric(factor(pat_id_p)),
+
+    # Create separate columns for modeling
+    Y = total_mme,         # Main: total MME
+    Y2 = total_op_quan,    # Total opioid quantity
+    Y3 = total_dayssup     # Total days' supply
+  )
+```
+
+```{r}
+cohorts_att <- 2007:2014
+
+d_full <- data_cs_patient_ces %>%
+  filter(
+    T >= 2006, T <= 2015,                      # calendar year restriction
+    G == 0L | G %in% cohorts_att | G > 2014     # keep never-treated, target cohorts, and late adopters
+  )
+
+
+# 1 First we do all work for MME which is turned in "y" which is Total MME per delivery
+#Step 1: Run full model
+att_gt_full_y <- att_gt(
+  yname          = "Y",
+  gname          = "G",        # first treatment year (0=never)
+  idname         = "id",
+  tname          = "T",        # calendar year
+  xformla        = ~ age,
+  data           = d_full,
+  panel          = FALSE,      # repeated cross-sections at patient-year
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+summary(att_gt_full_y)
+
+# Step 2: Event-study style aggregation with a tight window
+dyn_pool_y <- aggte(
+  att_gt_full_y,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3
+)
+summary(dyn_pool_y)
+ggdid(dyn_pool_y)
+
+```
+#P-value for pre-test of parallel trends assumption:  0.22806
+
+
+
+##Y2
+```{r}
+# 2 second we do all work for OP Quant which is turned in "y2" col in dataset
+#Step 1: Run full model
+att_gt_full_y2 <- att_gt(
+  yname          = "Y2",
+  gname          = "G",        # first treatment year (0=never)
+  idname         = "id",
+  tname          = "T",        # calendar year
+  xformla        = ~ age,
+  data           = d_full,
+  panel          = FALSE,      # repeated cross-sections at patient-year
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+summary(att_gt_full_y2)
+
+# Step 2. Event-study style aggregation with a tight window
+dyn_pool_y2 <- aggte(
+  att_gt_full_y2,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3
+)
+summary(dyn_pool_y2)
+ggdid(dyn_pool_y2)
+
+```
+#P-value for pre-test of parallel trends assumption:  0.19496
+
+```{r}
+# 3 Third we do all work for DaySup which is turned in "y3" col in dataset
+#Step 1: Run full model
+att_gt_full_y3 <- att_gt(
+  yname          = "Y3",
+  gname          = "G",        # first treatment year (0=never)
+  idname         = "id",
+  tname          = "T",        # calendar year
+  xformla        = ~ age,
+  data           = d_full,
+  panel          = FALSE,      # repeated cross-sections at patient-year
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+summary(att_gt_full_y3)
+
+# Step 2. Event-study style aggregation with a tight window
+dyn_pool_y3 <- aggte(
+  att_gt_full_y3,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3
+)
+summary(dyn_pool_y3)
+ggdid(dyn_pool_y3)
+
+```
+
+
+
+#### 1B Vaginal
+
+```{r}
+data_Vaginal <- data_cs %>%
+  filter(delivery == "Vaginal")
+```
+
+```{r}
+data_cs_patient_vag <- data_Vaginal %>%
+  group_by(pat_id_p, pat_state) %>%
+  summarise(
+    # Aggregate outcomes
+    total_mme = sum(Y_mme, na.rm = TRUE),
+    total_op_quan = sum(Y_op_quan, na.rm = TRUE),
+    total_dayssup = sum(Y_dayssup, na.rm = TRUE),
+
+    avg_mme = mean(Y_mme, na.rm = TRUE),
+    avg_op_quan = mean(Y_op_quan, na.rm = TRUE),
+    avg_dayssup = mean(Y_dayssup, na.rm = TRUE),
+
+    num_prescriptions = n(),
+
+    # Keep patient-level covariates
+    G = first(G),
+    T = first(T),
+    age = first(age),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    id = as.numeric(factor(pat_id_p)),
+
+    # Create separate columns for modeling
+    Y = total_mme,         # Main: total MME
+    Y2 = total_op_quan,    # Total opioid quantity
+    Y3 = total_dayssup     # Total days' supply
+  )
+```
+
+
+
+
+```{r}
+cohorts_att <- 2007:2014
+
+d_full <- data_cs_patient_vag %>%
+  filter(
+    T >= 2006, T <= 2015,                      # calendar year restriction
+    G == 0L | G %in% cohorts_att | G > 2014     # keep never-treated, target cohorts, and late adopters
+  )
+
+
+# 1 First we do all work for MME which is turned in "y" which is Total MME per delivery
+#Step 1: Run full model
+att_gt_full_y <- att_gt(
+  yname          = "Y",
+  gname          = "G",        # first treatment year (0=never)
+  idname         = "id",
+  tname          = "T",        # calendar year
+  xformla        = ~ age,
+  data           = d_full,
+  panel          = FALSE,      # repeated cross-sections at patient-year
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+summary(att_gt_full_y)
+
+# Step 2: Event-study style aggregation with a tight window
+dyn_pool_y <- aggte(
+  att_gt_full_y,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3
+)
+summary(dyn_pool_y)
+ggdid(dyn_pool_y)
+
+```
+#P-value for pre-test of parallel trends assumption:  0.22806
+
+
+
+##Y2
+```{r}
+# 2 second we do all work for OP Quant which is turned in "y2" col in dataset
+#Step 1: Run full model
+att_gt_full_y2 <- att_gt(
+  yname          = "Y2",
+  gname          = "G",        # first treatment year (0=never)
+  idname         = "id",
+  tname          = "T",        # calendar year
+  xformla        = ~ age,
+  data           = d_full,
+  panel          = FALSE,      # repeated cross-sections at patient-year
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+summary(att_gt_full_y2)
+
+# Step 2. Event-study style aggregation with a tight window
+dyn_pool_y2 <- aggte(
+  att_gt_full_y2,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3
+)
+summary(dyn_pool_y2)
+ggdid(dyn_pool_y2)
+
+```
+#P-value for pre-test of parallel trends assumption:  0.19496
+
+```{r}
+# 3 Third we do all work for DaySup which is turned in "y3" col in dataset
+#Step 1: Run full model
+att_gt_full_y3 <- att_gt(
+  yname          = "Y3",
+  gname          = "G",        # first treatment year (0=never)
+  idname         = "id",
+  tname          = "T",        # calendar year
+  xformla        = ~ age,
+  data           = d_full,
+  panel          = FALSE,      # repeated cross-sections at patient-year
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+summary(att_gt_full_y3)
+
+# Step 2. Event-study style aggregation with a tight window
+dyn_pool_y3 <- aggte(
+  att_gt_full_y3,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3
+)
+summary(dyn_pool_y3)
+ggdid(dyn_pool_y3)
+
+```
