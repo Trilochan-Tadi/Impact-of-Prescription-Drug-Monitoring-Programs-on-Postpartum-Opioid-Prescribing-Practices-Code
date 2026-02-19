@@ -1,0 +1,874 @@
+---
+title: "42_day_eda"
+output: html_document
+date: "2026-01-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# EDA on 45 day final cohort 
+
+
+## libaries
+```{r}
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(tidyverse)
+library(lubridate)
+```
+
+```{r}
+cohort_data <- fread("//chcdfiles.uthouston.edu/extract/vivas_postpartum/chelsea/datalake/New_cohort/New_filters/Cohort/final_42_2.csv")
+cohort_data2 <- fread("//chcdfiles.uthouston.edu/extract/vivas_postpartum/chelsea/datalake/New_cohort/New_filters/Cohort/final_42_2.csv")
+
+```
+```{r}
+medical_comb <- fread("//chcdfiles.uthouston.edu/extract/vivas_postpartum/chelsea/datalake/New_cohort/New_filters/Cohort/cohort_delivery_type_42_2_days_with_covariates.csv")
+
+medical_comb_all <- medical_comb %>%
+  semi_join(cohort_data, by = "pat_id_p") %>%
+  distinct(pat_id_p, .keep_all = TRUE) %>%
+  select(pat_id_p, asthma, hypertension, diabetes, depression,oud,palliative)
+```
+```{r}
+dates <- fread("//chcdfiles.uthouston.edu/extract/vivas_postpartum/chelsea/datalake/final_codes/PDMPs_table.csv")
+```
+
+```{r}
+colnames(cohort_data)
+str(cohort_data)
+```
+
+## preganicies, pateints  and type of deliveries 
+
+```{r}
+length(unique(cohort_data$pat_id))##619558
+length(unique(cohort_data$pat_id_p))##714401
+## number of claims/observations 465338
+```
+
+```{r}
+cohort_data %>%
+  filter(!is.na(type_of_delivery)) %>%
+  distinct(pat_id_p, type_of_delivery) %>%
+  count(type_of_delivery)
+```
+
+## route in terms of calims 
+```{r}
+unique(cohort_data$route, useNA = "ifany")
+```
+
+```{r}
+table(cohort_data$route,useNA = "ifany")
+```
+```{r}
+cohort_data %>%
+  filter(!is.na(opioid_dates) & is.na(route)) %>%
+  nrow()
+
+```
+```{r}
+cohort_data %>%
+  filter(!is.na(opioid_dates)) %>%
+  distinct(pat_id_p) %>%
+  nrow()
+```
+
+```{r}
+n_opioid_no <- cohort_data %>%
+  filter(opioid_prescribed == "No") %>%
+  distinct(pat_id_p) %>%
+  nrow()
+
+n_opioid_no
+```
+
+
+```{r}
+cohort_data %>%
+  filter(!is.na(opioid_dates) & is.na(dosage_form_nm)) %>%
+  nrow()
+
+```
+
+#11,208 or 2.4 % are not oral which will be removed and standrdized to oral route medications only
+## Standradized Cohort_data route = oral
+# checking for The  dossage forms 
+#post standardtization pateints and preg numbers
+
+
+```{r}
+library(stringr)
+
+cohort_data <- cohort_data %>%
+  mutate(
+    route_std  = str_to_upper(str_trim(route)),
+    dosage_std = str_to_upper(str_trim(dosage_form_nm))
+  ) %>%
+  filter(
+    is.na(opioid_dates) |                     # keep everyone with NO opioid claim
+      (route_std == "ORAL" & dosage_std == "TABLET")  # keep opioid claims only if oral+tablet
+  ) %>%
+  select(-route_std, -dosage_std)
+
+```
+
+```{r}
+length(unique(cohort_data$pat_id))##131199
+length(unique(cohort_data$pat_id_p))##138085
+## number of claims/observations 443631
+```
+```{r}
+cohort_data <- cohort_data%>%
+  mutate(
+    MME = strength_op * op_quan * MME_Conversion_Factor
+  )
+View(cohort_data)
+```
+
+## data pre process
+```{r}
+cohort_data <- cohort_data %>%
+  mutate(
+    insurance_group = case_when(
+      pay_type %in% c("M", "K")        ~ "Medicaid",
+      pay_type %in% c("C")             ~ "Commercial",
+      pay_type %in% c("S")             ~ "Self",
+      pay_type %in% c("R", "A", "T")   ~ "Medicare",
+      pay_type %in% c("U")             ~ "Missing",
+      pay_type %in% c("X")             ~ "Rx-only",
+      TRUE                             ~ "Other"
+    )
+  ) %>%
+  # keep insurance restriction for everyone
+  filter(!insurance_group %in% c("Medicare", "Missing", "Rx-only")) %>%
+ 
+  # clean state for everyone
+  filter(!is.na(pat_state), pat_state != "") %>%
+ 
+  # ONLY apply opioid-specific cleaning when an opioid date exists
+  filter(
+    is.na(opioid_dates) |
+      (
+        !is.na(op_dayssup) &
+        op_dayssup > 0 &
+        op_dayssup <= 999 &
+        !is.na(mme) &
+        mme > 0
+      )
+  )
+length(unique(cohort_data$pat_id))##584094
+length(unique(cohort_data$pat_id_p))##672005
+## number of claims/observations 404568
+```
+
+```{r}
+cohort_data <- cohort_data %>%
+  left_join(
+    medical_comb_all %>%
+      select(pat_id_p, oud, palliative),
+    by = "pat_id_p"
+  )
+
+
+```
+
+```{r}
+cohort_data %>%
+  distinct(pat_id_p, oud) %>%
+  filter(oud == 1) %>%
+  nrow()
+
+```
+
+```{r}
+cohort_data %>%
+  distinct(pat_id_p, palliative) %>%
+  filter(palliative == 1) %>%
+  nrow()
+```
+
+```{r}
+cohort_data <- cohort_data %>%
+  filter(
+    is.na(opioid_dates) |        # keep all non-opioid pregnancies
+    op_quan <= 200               # keep opioid claims with plausible quantity
+  )
+
+
+
+
+length(unique(cohort_data$pat_id))##584004
+length(unique(cohort_data$pat_id_p))##671906
+```
+## droping duplicate claism :
+```{r}
+cohort_data_nodup <- cohort_data %>%
+  mutate(is_opioid_claim = !is.na(opioid_dates)) %>%
+  group_by(is_opioid_claim) %>%
+  group_modify(~{
+    if (.y$is_opioid_claim) {
+      distinct(
+        .x,
+        pat_id_p, opioid_dates, presc_opioid, op_dayssup, op_quan,
+        strength_op, MME_Conversion_Factor,
+        .keep_all = TRUE
+      )
+    } else {
+      .x
+    }
+  }) %>%
+  ungroup() %>%
+  select(-is_opioid_claim)
+
+length(unique(cohort_data_nodup$pat_id))##584004
+length(unique(cohort_data_nodup$pat_id_p))
+```
+
+
+
+```{r}
+cohort_data_nodup <- cohort_data_nodup %>%
+  mutate(
+    has_opioid_claim = as.integer(!is.na(opioid_dates))
+  )
+
+cohort_data_nodup <- cohort_data_nodup %>%
+  group_by(pat_id_p) %>%
+  mutate(
+    any_opioid_claim = as.integer(any(has_opioid_claim == 1, na.rm = TRUE))
+  ) %>%
+  ungroup()
+
+# claim-level
+table(cohort_data_nodup$has_opioid_claim, useNA = "ifany")
+
+# pregnancy-level
+cohort_data_nodup %>%
+  distinct(pat_id_p, any_opioid_claim) %>%
+  count(any_opioid_claim)
+```
+
+
+
+
+
+
+
+
+
+```{r}
+cohort_data_nodup <- cohort_data_nodup %>%
+  mutate(
+    opioid_dates = ymd(opioid_dates),
+    delivery_dt = ymd(delivery_dt)
+  )
+```
+
+```{r}
+cohort_data_nodup<- cohort_data_nodup %>%
+  mutate(
+    opioid_exposed_90d_pre_delivery = 
+      !is.na(opioid_dates)&
+      opioid_dates >= (delivery_dt-90)&
+      opioid_dates < delivery_dt
+  )%>%
+  group_by(pat_id_p) %>%
+    mutate( opioid_exposed_90d_pre_delivery = as.integer(any(opioid_exposed_90d_pre_delivery, na.rm = TRUE)),
+            opioid_naive_90d_pre_delivery = 1L - opioid_exposed_90d_pre_delivery
+          )%>%
+  ungroup()
+```
+
+
+
+```{r}
+cohort_data_nodup %>%
+  distinct(pat_id_p,opioid_naive_90d_pre_delivery)%>%
+  count(opioid_naive_90d_pre_delivery)
+```
+
+## within 7 dy opioid exposue after delivery 
+```{r}
+cohort_data_nodup <- cohort_data_nodup %>%
+  mutate(
+    opioid_exposed_7d_post_delivery =
+      !is.na(opioid_dates) &
+      opioid_dates >= delivery_dt &
+      opioid_dates <= (delivery_dt + 7)
+  ) %>%
+  group_by(pat_id_p) %>%
+  mutate(
+    opioid_exposed_7d_post_delivery =
+      as.integer(any(opioid_exposed_7d_post_delivery, na.rm = TRUE)),
+    opioid_naive_7d_post_delivery =
+      1L - opioid_exposed_7d_post_delivery
+  ) %>%
+  ungroup()
+
+```
+
+```{r}
+cohort_data_nodup %>%
+  distinct(pat_id_p, opioid_naive_7d_post_delivery) %>%
+  count(opioid_naive_7d_post_delivery)
+```
+
+
+### opioid presciption eda
+```{r}
+cohort_data_nodup <- cohort_data_nodup %>%
+  mutate(
+    postpartum_opioid = !is.na(opioid_dates) &
+      opioid_dates >= delivery_dt &
+      opioid_dates <= delivery_dt+42
+  )
+```
+
+```{r}
+cohort_data <- cohort_data %>%
+  mutate(
+    postpartum_opioid = !is.na(opioid_dates) &
+      opioid_dates >= delivery_dt &
+      opioid_dates <= delivery_dt+42
+  )
+```
+
+## 90 mme 
+```{r}
+pp_claims_42d <- cohort_data_nodup %>%
+  filter(postpartum_opioid)
+
+pp_90mme_claims <- pp_claims_42d %>%
+  mutate(mme90_flag = !is.na(mme) & mme > 90) %>%
+  group_by(pat_id_p) %>%
+  summarise(
+    n_claims_mme_gt90_42d = sum(mme90_flag, na.rm = TRUE),
+    any_claim_mme_gt90_42d = as.integer(any(mme90_flag, na.rm = TRUE)),
+    .groups = "drop"
+  )
+length(unique(pp_90mme_claims$pat_id_p))
+```
+
+
+
+
+
+# preg level postpartum summaries
+```{r}
+pp_summary <- cohort_data_nodup %>%
+  filter(postpartum_opioid)%>%
+  group_by(pat_id_p)%>%
+  summarise(
+    pp_fills_42d = n(),
+    pp_days_supply_42d = sum(op_dayssup,na.rm = TRUE),
+    .groups =  "drop"
+  )
+pp_summary_full <- cohort_data_nodup%>%
+  distinct(pat_id_p)%>%
+  left_join(pp_summary, by = "pat_id_p") %>%
+  mutate(
+    pp_fills_42d = if_else(is.na(pp_fills_42d),0L, pp_fills_42d),
+    pp_days_supply_42d = if_else(is.na(pp_days_supply_42d),0,pp_days_supply_42d)
+  )
+
+```
+
+```{r}
+pp_summary_full %>%
+  summarise(
+    total_pregnancies = n(),
+
+    mean_fills = mean(pp_fills_42d),
+    median_fills = median(pp_fills_42d),
+    max_fills = max(pp_fills_42d),
+
+    mean_days = mean(pp_days_supply_42d),
+    median_days = median(pp_days_supply_42d),
+    max_days = max(pp_days_supply_42d)
+  )
+```
+
+```{r}
+pp_summary_full %>%
+  count(pp_fills_42d) %>%
+  arrange(pp_fills_42d)
+
+pp_summary_full %>%
+  mutate(
+    fills_group = case_when(
+      pp_fills_42d == 0 ~ "0",
+      pp_fills_42d == 1 ~ "1",
+      pp_fills_42d == 2 ~ "2",
+      pp_fills_42d >= 3 ~ "3+"
+    )
+  ) %>%
+  count(fills_group)
+
+pp_summary_full %>%
+  mutate(
+    days_group = case_when(
+      pp_days_supply_42d == 0 ~ "0",
+      pp_days_supply_42d <= 5 ~ "1–5",
+      pp_days_supply_42d <= 10 ~ "6–10",
+      pp_days_supply_42d <= 30 ~ "11–30",
+      pp_days_supply_42d > 30 ~ "31+"
+    )
+  ) %>%
+  count(days_group)
+```
+
+## pre dleivery opioid number okay
+```{r}
+pre_exposed_data <- cohort_data_nodup %>%
+  filter(opioid_exposed_90d_pre_delivery == 1)
+pre_delivery_summary <- pre_exposed_data %>%
+  filter(
+    !is.na(opioid_dates),
+    opioid_dates >= delivery_dt - 90,
+    opioid_dates < delivery_dt
+  ) %>%
+  group_by(pat_id_p) %>%
+  summarise(
+    pre_fills_90d = n(),
+    pre_days_supply_90d = sum(op_dayssup, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r}
+pre_delivery_summary %>%
+  summarise(
+    n_pregnancies = n(),
+    mean_fills = mean(pre_fills_90d),
+    median_fills = median(pre_fills_90d),
+    max_fills = max(pre_fills_90d),
+    mean_days = mean(pre_days_supply_90d),
+    median_days = median(pre_days_supply_90d),
+    max_days = max(pre_days_supply_90d)
+  )
+
+pre_delivery_summary %>%
+  count(pre_fills_90d) %>%
+ arrange(pre_fills_90d)
+pre_delivery_summary %>%
+  mutate(
+    pre_fills_group = case_when(
+      pre_fills_90d == 1 ~ "1",
+      pre_fills_90d == 2 ~ "2",
+      pre_fills_90d >= 3 ~ "3+"
+    )
+  ) %>%
+  count(pre_fills_group)
+pre_delivery_summary %>%
+  mutate(
+    pre_days_group = case_when(
+      pre_days_supply_90d <= 5 ~ "1–5",
+      pre_days_supply_90d <= 10 ~ "6–10",
+      pre_days_supply_90d <= 30 ~ "11–30",
+      pre_days_supply_90d > 30 ~ "31+"
+    )
+  ) %>%
+  count(pre_days_group)
+```
+
+## Total MME in 42 day 
+```{r}
+pp_total_mme_42d <- pp_claims_42d %>%
+  group_by(pat_id_p) %>%
+  summarise(
+    total_MME_42d = sum(MME, na.rm = TRUE),
+    .groups = "drop"
+  )
+length(unique(pp_total_mme_42d$pat_id_p))
+
+```
+
+```{r}
+oud_pall_preg <- cohort_data_nodup %>%
+  distinct(pat_id_p, oud, palliative)
+```
+
+
+
+## We are now trying to for grouping preganicies based on teh risk factors okay  based on shah et al(doi insert here)
+
+## low Risk: Opioid naive 90 days prior to delivery or 1 prescription  with <5 days of supply
+# medium Risk: 2 prescription or 6-10 days supply
+# High risk : >= 3 presecription or 11-31 day's supply
+
+
+# first step will be exploring these three risk categories and loking ast binar of just low and hogh risk . in case of binary with just low and high risk these how i plan to catgrise thsi in accordance with shah et al
+
+(00nvzqk35vwzgs5d_1)
+
+```{r}
+risk_base <- cohort_data_nodup %>%
+  distinct(pat_id_p, opioid_naive_90d_pre_delivery) %>%
+  left_join(oud_pall_preg, by = "pat_id_p") %>%
+  left_join(pp_summary, by = "pat_id_p") %>%
+  left_join(pre_delivery_summary, by = "pat_id_p") %>%
+  left_join(pp_90mme_claims, by = "pat_id_p") %>%
+  left_join(pp_total_mme_42d, by = "pat_id_p") %>%
+  mutate(
+    pp_fills_42d = if_else(is.na(pp_fills_42d), 0L, pp_fills_42d),
+    pp_days_supply_42d = if_else(is.na(pp_days_supply_42d), 0, pp_days_supply_42d),
+    pre_fills_90d = if_else(is.na(pre_fills_90d), 0L, pre_fills_90d),
+    pre_days_supply_90d = if_else(is.na(pre_days_supply_90d), 0, pre_days_supply_90d),
+
+    oud = if_else(is.na(oud), 0L, oud),
+    palliative = if_else(is.na(palliative), 0L, palliative),
+
+    n_claims_mme_gt90_42d = if_else(is.na(n_claims_mme_gt90_42d), 0L, n_claims_mme_gt90_42d),
+    any_claim_mme_gt90_42d = if_else(is.na(any_claim_mme_gt90_42d), 0L, any_claim_mme_gt90_42d),
+
+    total_MME_42d = if_else(is.na(total_MME_42d), 0, total_MME_42d)
+  )
+
+```
+
+
+
+
+```{r}
+# risk_base <- cohort_data %>%
+#   distinct(pat_id_p, opioid_naive_90d_pre_delivery) %>%   # one row per pregnancy
+#   left_join(pp_summary, by = "pat_id_p") %>%
+#   left_join(pre_delivery_summary, by = "pat_id_p") %>%
+#   mutate(
+#     pp_fills_42d = if_else(is.na(pp_fills_42d), 0L, pp_fills_42d),
+#     pp_days_supply_42d = if_else(is.na(pp_days_supply_42d), 0, pp_days_supply_42d),
+#     pre_fills_90d = if_else(is.na(pre_fills_90d), 0L, pre_fills_90d),
+#     pre_days_supply_90d = if_else(is.na(pre_days_supply_90d), 0, pre_days_supply_90d)
+#   )
+
+```
+
+
+
+
+
+## binary risk:
+ ```{r}
+# risk_base <- risk_base %>%
+#   mutate(
+#     # Safety: make sure missing summaries don't break classification
+#     pp_fills_42d = if_else(is.na(pp_fills_42d), 0L, pp_fills_42d),
+#     pp_days_supply_42d = if_else(is.na(pp_days_supply_42d), 0, pp_days_supply_42d),
+#
+#     # Binary risk group
+#     risk_3tier = case_when(
+#       opioid_naive_90d_pre_delivery == 1 &
+#         pp_fills_42d <= 2 &
+#         pp_days_supply_42d <= 5 ~ "Low",
+#       TRUE ~ "High"
+#     )
+#   )
+#
+# df_low_ids  <- risk_base %>% filter(risk_3tier == "Low")  %>% select(pat_id_p)
+# df_high_ids <- risk_base %>% filter(risk_3tier == "High") %>% select(pat_id_p)
+#
+# risk_base %>%
+#   count(risk_3tier)
+ ```
+
+```{r}
+risk_base <- risk_base %>%
+  mutate(
+    # safety fills
+    pp_fills_42d = if_else(is.na(pp_fills_42d), 0L, pp_fills_42d),
+    pp_days_supply_42d = if_else(is.na(pp_days_supply_42d), 0, pp_days_supply_42d),
+
+    # safety new vars (if you joined them in)
+    total_MME_42d = if_else(is.na(total_MME_42d), 0, total_MME_42d),
+    oud = if_else(is.na(oud), 0L, oud),
+
+    # UPDATED binary risk group
+    risk_binary = case_when(
+      oud == 1L ~ "High",
+      total_MME_42d >= 700 ~ "High",
+
+      opioid_naive_90d_pre_delivery == 1 &
+        pp_fills_42d <= 2 &
+        pp_days_supply_42d <= 5 ~ "Low",
+
+      TRUE ~ "High"
+    )
+  )
+
+df_low_ids  <- risk_base %>% filter(risk_binary == "Low")  %>% select(pat_id_p)
+df_high_ids <- risk_base %>% filter(risk_binary == "High") %>% select(pat_id_p)
+
+risk_base %>% 
+  count(risk_binary)
+```
+
+High	50594			
+Low	621312	
+
+### runing a did model on all the without risk factors 
+```{r}
+medical_comb_all <- medical_comb %>%
+  semi_join(cohort_data_nodup, by = "pat_id_p") %>%
+  distinct(pat_id_p, .keep_all = TRUE) %>%
+  select(pat_id_p, asthma, hypertension, diabetes, depression,oud,palliative)
+```
+
+```{r}
+
+data_c_a <- cohort_data_nodup  %>%
+  select(
+    pat_state,
+    pat_id_p,
+    der_yob,
+    opioid_dates,
+    delivery_dt,
+    mme,
+    op_quan,
+    op_dayssup,
+    type_of_delivery,
+    total_pregnancies,
+    insurance_group,
+    palliative
+  )
+
+#2 Ensure date columns are properly formatted
+data_c_a <- data_c_a %>%
+  mutate(
+    opioid_dates = ymd(opioid_dates),
+    delivery_dt  = ymd(delivery_dt)
+  )
+data_c_a <- data_c_a %>%
+  mutate(
+    has_opioid_claim_row = as.integer(!is.na(opioid_dates))  # claim-level row flag
+  )
+#3 Check for Missing Data (DO NOT drop missing opioid_dates)
+# Keep pregnancies even if no opioid rows exist in postpartum window.
+# Only require pat_state and delivery_dt because these define the pregnancy and the time index.
+data_c_a <- data_c_a %>%
+  filter(
+    !is.na(pat_state),
+    !is.na(delivery_dt)
+  )
+
+#4 Define pregnancy time (T) and age using DELIVERY date (not opioid_dates)
+data_c_a <- data_c_a %>%
+  mutate(
+    T = year(delivery_dt),
+    age_at_delivery = year(delivery_dt) - der_yob
+  )
+
+#5 Define postpartum window indicator (0–42 days postpartum for THIS pregnancy)
+# NOTE: use >= to include same-day discharge prescriptions
+data_c_a <- data_c_a %>%
+  mutate(
+    postpartum_42d =
+      !is.na(opioid_dates) &
+      opioid_dates >= delivery_dt &
+      opioid_dates <= delivery_dt + days(42)
+  )
+# 5b) Drop high MME/day postpartum claims (>=90) ONLY for NON-palliative
+# - keeps ALL non-opioid rows (opioid_dates is NA)
+# - keeps ALL non-postpartum rows (so pre-delivery stuff isn't touched)
+# - keeps palliative rows even if mme >= 90
+
+data_c_a <- data_c_a %>%
+  filter(
+    is.na(opioid_dates) |                 # keep non-opioid pregnancies/rows
+      !postpartum_42d |                   # keep rows outside 0–42d postpartum window
+      palliative == 1 |                   # keep palliative claims no matter what
+      is.na(mme) |                        # keep if mme missing (optional)
+      mme <= 90                            # keep non-palliative postpartum claims only if <90
+  )
+
+#6 Formatting PDMP adoption date to match
+dates_c <- dates %>%
+  mutate(
+    creation_pdmp = ymd(paste0(str_trim(creation_pdmp), "-01"))
+  ) %>%
+  select(pat_state, creation_pdmp)
+
+#7 Merge PDMP timing onto pregnancy data
+data_m_a <- data_c_a %>%
+  left_join(dates_c, by = "pat_state") %>%
+  mutate(
+    G = if_else(is.na(creation_pdmp), 0L, year(creation_pdmp))
+  )
+
+```
+
+```{r}
+#8A Aggregate to pregnancy-level outcomes (postpartum 0–42 days only)
+data_preg_a <- data_m_a %>%
+  group_by(pat_id_p) %>%
+  summarise(
+    pat_state = first(pat_state),
+    delivery_dt = first(delivery_dt),
+    creation_pdmp = first(creation_pdmp),
+    G = first(G),
+    T = first(T),
+
+    age = first(age_at_delivery),
+    delivery = first(type_of_delivery),
+    pregnancies = first(total_pregnancies),
+    insurance = first(insurance_group),
+
+    # Outcomes (postpartum only)
+    Y_mme     = sum(mme[postpartum_42d], na.rm = TRUE),
+    Y_op_quan = sum(op_quan[postpartum_42d], na.rm = TRUE),
+    Y_dayssup = sum(op_dayssup[postpartum_42d], na.rm = TRUE),
+    pp_fills_42d = sum(postpartum_42d, na.rm = TRUE),
+
+    #Pregnancy-level opioid indicator
+    any_opioid_42d = as.integer(any(postpartum_42d, na.rm = TRUE)),
+
+    # Keep palliative status at pregnancy level (if you have it in claims)
+    any_palliative = as.integer(any(palliative == 1, na.rm = TRUE)),
+
+    .groups = "drop"
+  )
+# 8A.1 Add comorbidities (0/1) to pregnancy-level dataset
+data_preg_a <- data_preg_a %>%
+  left_join(medical_comb_high, by = "pat_id_p") %>%
+  mutate(
+    across(c(asthma, hypertension, diabetes, depression, oud, palliative),
+           ~ replace_na(as.integer(.), 0L)),
+    any_comorbidity = as.integer(asthma==1 | hypertension==1 | diabetes==1 | depression==1)
+  )
+
+
+
+data_cs_a <- data_preg_a %>%
+  mutate(id = as.numeric(factor(pat_id_p))) %>%
+  select(
+    id, G, T, pat_state, pat_id_p,
+    age, delivery, pregnancies, insurance,
+
+    # outcomes
+    Y_mme, Y_op_quan, Y_dayssup, pp_fills_42d,
+    any_opioid_42d,
+
+    # comorbidities
+    asthma, hypertension, diabetes, depression, any_comorbidity,
+    oud, palliative
+  )
+
+
+head(data_cs_a)
+summary(data_cs_a)
+
+
+```
+
+```{r}
+data_cs_a %>%
+  count(any_opioid_42d)
+  
+```
+
+```{r}
+risk_lookup <- risk_base %>%
+  select(pat_id_p, risk_binary)
+
+d_full_a <- d_full_a %>%
+  left_join(risk_lookup, by = "pat_id_p")
+```
+
+
+
+```{r}
+# step 9 : implementaning C&S 
+
+#9A: definine teh time
+data_cs_a_filtered <- data_cs_a %>%
+  filter(T >= 2006 & T<=2015)
+cohorts_att <- 2007:2015
+
+d_full_a <- data_cs_a_filtered %>%
+  filter(
+    T >= 2006 & T <= 2015,
+    G == 0L | G %in% cohorts_att | G > 2014
+  )
+
+data_cs_a_filtered_T <- data_cs_a %>%
+  filter(T >= 2006 & T<=2015)
+
+
+```
+
+
+
+
+
+```{r}
+# step 9b C&S model outome mme per day 
+
+att_gt_full_mme <- att_gt(
+  yname          = "Y_mme",
+  gname          = "G",
+  idname         = "id",
+  tname          = "T",
+  xformla        = ~ age + any_comorbidity,
+  data           = d_full_a,
+  panel          = FALSE,        # pregnancy-level repeated cross-sections
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+
+summary(att_gt_full_mme)
+
+dyn_pool_mme <- aggte(
+  att_gt_full_mme,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3
+)
+
+summary(dyn_pool_mme)
+ggdid(dyn_pool_mme)
+```
+
+## with covraites
+
+
+
+
+```{r}
+# step 9b C&S model outome mme per day 
+
+att_gt_full_mme <- att_gt(
+  yname          = "Y_mme",
+  gname          = "G",
+  idname         = "id",
+  tname          = "T",
+   xformla        = ~ age +any_comorbidity,
+  data           = d_full_nh,
+  panel          = FALSE,        # pregnancy-level repeated cross-sections
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+
+summary(att_gt_full_mme)
+
+dyn_pool_mme <- aggte(
+  att_gt_full_mme,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3
+)
+
+summary(dyn_pool_mme)
+ggdid(dyn_pool_mme)
+```
+
+
+
+
+
+
+

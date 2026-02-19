@@ -1,0 +1,622 @@
+---
+title: "42 days high did model"
+output: html_document
+date: "2026-01-20"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(dplyr)
+library(haven)
+library(ggplot2)
+library(fixest)
+library(broom)
+library(data.table)
+library(did)
+```
+
+```{r}
+dates <- fread("//chcdfiles.uthouston.edu/extract/vivas_postpartum/chelsea/datalake/final_codes/PDMPs_table.csv")
+```
+
+
+```{r}
+cohort_high <- cohort_data_nodup %>%
+  semi_join(df_high_ids, by = "pat_id_p")
+```
+
+
+```{r}
+medical_comb <- fread("//chcdfiles.uthouston.edu/extract/vivas_postpartum/chelsea/datalake/New_cohort/New_filters/Cohort/cohort_delivery_type_42_2_days_with_covariates.csv")
+
+medical_comb_high <- medical_comb %>%
+  semi_join(df_high_ids, by = "pat_id_p") %>%
+  distinct(pat_id_p, .keep_all = TRUE) %>%
+  select(pat_id_p, asthma, hypertension, diabetes, depression,oud,palliative)
+
+```
+
+
+
+
+
+
+```{r}
+
+data_c_h <- cohort_high %>%
+  select(
+    pat_state,
+    pat_id_p,
+    der_yob,
+    opioid_dates,
+    delivery_dt,
+    mme,
+    op_quan,
+    op_dayssup,
+    type_of_delivery,
+    total_pregnancies,
+    insurance_group,
+    palliative
+  )
+
+#2 Ensure date columns are properly formatted
+data_c_h <- data_c_h %>%
+  mutate(
+    opioid_dates = ymd(opioid_dates),
+    delivery_dt  = ymd(delivery_dt)
+  )
+
+#3 Check for Missing Data (DO NOT drop missing opioid_dates)
+# Keep pregnancies even if no opioid rows exist in postpartum window.
+# Only require pat_state and delivery_dt because these define the pregnancy and the time index.
+data_c_h <- data_c_h %>%
+  filter(
+    !is.na(pat_state),
+    !is.na(delivery_dt)
+  )
+
+#4 Define pregnancy time (T) and age using DELIVERY date (not opioid_dates)
+data_c_h <- data_c_h %>%
+  mutate(
+    T = year(delivery_dt),
+    age_at_delivery = year(delivery_dt) - der_yob
+  )
+
+#5 Define postpartum window indicator (0–42 days postpartum for THIS pregnancy)
+# NOTE: use >= to include same-day discharge prescriptions
+data_c_h <- data_c_h %>%
+  mutate(
+    postpartum_42d =
+      !is.na(opioid_dates) &
+      opioid_dates >= delivery_dt &
+      opioid_dates <= delivery_dt + days(42)
+  )
+# 5b) Drop high MME/day postpartum claims (>=90) ONLY for NON-palliative
+# - keeps ALL non-opioid rows (opioid_dates is NA)
+# - keeps ALL non-postpartum rows (so pre-delivery stuff isn't touched)
+# - keeps palliative rows even if mme >= 90
+
+data_c_h <- data_c_h %>%
+  filter(
+    is.na(opioid_dates) |                 # keep non-opioid pregnancies/rows
+      !postpartum_42d |                   # keep rows outside 0–42d postpartum window
+      palliative == 1 |                   # keep palliative claims no matter what
+      is.na(mme) |                        # keep if mme missing (optional)
+      mme <= 90                            # keep non-palliative postpartum claims only if <90
+  )
+
+#6 Formatting PDMP adoption date to match
+dates_c <- dates %>%
+  mutate(
+    creation_pdmp = ymd(paste0(str_trim(creation_pdmp), "-01"))
+  ) %>%
+  select(pat_state, creation_pdmp)
+
+#7 Merge PDMP timing onto pregnancy data
+data_m_h <- data_c_h %>%
+  left_join(dates_c, by = "pat_state") %>%
+  mutate(
+    G = if_else(is.na(creation_pdmp), 0L, year(creation_pdmp))
+  )
+
+```
+
+```{r}
+#8A Aggregate to pregnancy-level outcomes (postpartum 0–42 days only)
+data_preg_h <- data_m_h %>%
+  group_by(pat_id_p) %>%
+  summarise(
+    pat_state = first(pat_state),
+    delivery_dt = first(delivery_dt),
+    creation_pdmp = first(creation_pdmp),
+    G = first(G),
+    T = first(T),
+
+    age = first(age_at_delivery),
+    delivery = first(type_of_delivery),
+    pregnancies = first(total_pregnancies),
+    insurance = first(insurance_group),
+
+    # Outcomes (postpartum only)
+    Y_mme     = sum(mme[postpartum_42d], na.rm = TRUE),
+    Y_op_quan = sum(op_quan[postpartum_42d], na.rm = TRUE),
+    Y_dayssup = sum(op_dayssup[postpartum_42d], na.rm = TRUE),
+    pp_fills_42d = sum(postpartum_42d, na.rm = TRUE),
+
+    #Pregnancy-level opioid indicator
+    any_opioid_42d = as.integer(any(postpartum_42d, na.rm = TRUE)),
+
+    # Keep palliative status at pregnancy level (if you have it in claims)
+    any_palliative = as.integer(any(palliative == 1, na.rm = TRUE)),
+
+    .groups = "drop"
+  )
+# 8A.1 Add comorbidities (0/1) to pregnancy-level dataset
+data_preg_h <- data_preg_h %>%
+  left_join(medical_comb_high, by = "pat_id_p") %>%
+  mutate(
+    across(c(asthma, hypertension, diabetes, depression),
+           ~ replace_na(as.integer(.), 0L)),
+    ## creating a composite indicator in order to use both asthma and depression has in our dataset from 2006-2015 are both are rare less than  2-3% causing the singular matrix 
+    any_comorbidity = as.integer(
+      asthma == 1| hypertension == 1| diabetes == 1| depression ==1
+    )
+  )
+
+
+
+#8B Prepare data for Callaway & Sant'Anna (one row per pregnancy)
+data_cs_h <- data_preg_h %>%
+  mutate(
+    id = as.numeric(factor(pat_id_p))
+  ) %>%
+  select(
+    id, G, T, pat_state, pat_id_p,
+    age, delivery, pregnancies, insurance,
+    Y_mme, Y_op_quan, Y_dayssup,pp_fills_42d,asthma,hypertension,diabetes,depression, any_comorbidity
+  )
+
+
+
+head(data_cs_h)
+summary(data_cs_h)
+
+```
+
+
+
+
+
+```{r}
+# step 9 : implementaning C&S 
+
+#9A: definine teh time
+data_cs_filtered_h <- data_cs_h %>%
+  filter(T >= 2006 & T<=2015)
+cohorts_att <- 2007:2015
+
+d_full_h <- data_cs_filtered_h %>%
+  filter(
+    T >= 2006 & T <= 2015,
+    G == 0L | G %in% cohorts_att | G > 2014
+  )
+
+
+
+```
+
+# full high risk model 
+```{r}
+# step 9b C&S model outome mme per day 
+
+att_gt_full_mme <- att_gt(
+  yname          = "Y_mme",
+  gname          = "G",
+  idname         = "id",
+  tname          = "T",
+  # xformla        = ~ age +any_comorbidity,
+  data           = d_full_h,
+  panel          = FALSE,        # pregnancy-level repeated cross-sections
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+
+#summary(att_gt_full_mme)
+
+dyn_pool_mme <- aggte(
+  att_gt_full_mme,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3
+)
+
+summary(dyn_pool_mme)
+ggdid(dyn_pool_mme)
+```
+
+
+
+
+
+
+
+```{r}
+# step 9c C&S model outome opioid qunity
+
+att_gt_full_opquan <- att_gt(
+  yname          = "Y_op_quan",
+  gname          = "G",
+  idname         = "id",
+  tname          = "T",
+# xformla        = ~  age +any_comorbidity,
+  data           = d_full_h,
+  panel          = FALSE,        # pregnancy-level repeated cross-sections
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+
+summary(att_gt_full_opquan)
+
+dyn_pool_opquan <- aggte(
+  att_gt_full_opquan,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3
+)
+
+summary(dyn_pool_opquan)
+ggdid(dyn_pool_opquan)
+```
+
+`
+```{r}
+# step 9d C&S model outome days supply
+
+att_gt_full_dayssup <- att_gt(
+  yname          = "Y_dayssup",
+  gname          = "G",
+  idname         = "id",
+  tname          = "T",
+ # xformla        = ~ age +any_comorbidity,
+  data           = d_full_h,
+  panel          = FALSE,        # pregnancy-level repeated cross-sections
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+
+summary(att_gt_full_dayssup)
+
+dyn_pool_dayssup <- aggte(
+  att_gt_full_dayssup,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3
+)
+
+summary(dyn_pool_dayssup)
+ggdid(dyn_pool_dayssup)
+```
+
+```{r}
+# step 9e C&S model outome days supply
+
+att_gt_full_fills <- att_gt(
+  yname          = "pp_fills_42d",
+  gname          = "G",
+  idname         = "id",
+  tname          = "T",
+#xformla        = ~ age +any_comorbidity,
+  data           = d_full_h,
+  panel          = FALSE,        # pregnancy-level repeated cross-sections
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+
+summary(att_gt_full_fills)
+
+dyn_pool_fills <- aggte(
+  att_gt_full_fills,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3
+)
+
+summary(dyn_pool_fills)
+ggdid(dyn_pool_fills)
+```
+
+-
+
+
+
+
+`
+
+
+## data_low sensitvity subgroup 
+```{r}
+data_cs_vag_high_filtered <-data_cs_filtered_h %>%
+  filter(delivery == "Vaginal")
+
+data_cs_vag_high_filtered <- data_cs_vag_high_filtered %>%
+  filter(T >= 2006 & T<=2015)
+cohorts_att <- 2007:2015
+
+d_full_vag_h <- data_cs_vag_high_filtered %>%
+  filter(
+    T >= 2006 & T <= 2015,
+    G == 0L | G %in% cohorts_att | G > 2014
+  )
+```
+
+```{r}
+data_cs_ces_high_filtered <-data_cs_filtered_h %>%
+  filter(delivery == "Cesarean")
+data_cs_ces_high_filtered <- data_cs_ces_high_filtered %>%
+  filter(T >= 2006 & T<=2015)
+cohorts_att <- 2007:2015
+
+d_full_ces_h <- data_cs_ces_high_filtered %>%
+  filter(
+    T >= 2006 & T <= 2015,
+    G == 0L | G %in% cohorts_att | G > 2014
+  )
+  
+```
+
+
+```{r}
+# step 9b C&S model outome mme per day 
+
+att_gt_full_mme <- att_gt(
+  yname          = "Y_mme",
+  gname          = "G",
+  idname         = "id",
+  tname          = "T",
+   xformla        = ~ age +any_comorbidity,
+  data           = d_full_vag_h,
+  panel          = FALSE,        # pregnancy-level repeated cross-sections
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+
+summary(att_gt_full_mme)
+
+dyn_pool_mme <- aggte(
+  att_gt_full_mme,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3
+)
+
+ summary(dyn_pool_mme)
+ ggdid(dyn_pool_mme)
+```
+
+
+```{r}
+# step 9c C&S model outome opioid qunity
+
+att_gt_full_opquan <- att_gt(
+  yname          = "Y_op_quan",
+  gname          = "G",
+  idname         = "id",
+  tname          = "T",
+ xformla        = ~  age +any_comorbidity,
+  data           = d_full_vag_h ,
+  panel          = FALSE,        # pregnancy-level repeated cross-sections
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+
+summary(att_gt_full_opquan)
+
+dyn_pool_opquan <- aggte(
+  att_gt_full_opquan,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3
+)
+
+ summary(dyn_pool_opquan)
+ggdid(dyn_pool_opquan)
+```
+
+
+
+
+```{r}
+# step 9d C&S model outome days supply
+
+att_gt_full_dayssup <- att_gt(
+  yname          = "Y_dayssup",
+  gname          = "G",
+  idname         = "id",
+  tname          = "T",
+  xformla        = ~ age +any_comorbidity,
+  data           = d_full_vag_h,
+  panel          = FALSE,        # pregnancy-level repeated cross-sections
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+
+#summary(att_gt_full_dayssup)
+
+dyn_pool_dayssup <- aggte(
+  att_gt_full_dayssup,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3
+)
+
+ summary(dyn_pool_dayssup)
+ggdid(dyn_pool_dayssup)
+```
+
+```{r}
+# step 9e C&S model outome precription
+
+att_gt_full_fills <- att_gt(
+  yname          = "pp_fills_42d",
+  gname          = "G",
+  idname         = "id",
+  tname          = "T",
+ xformla        = ~ age +any_comorbidity,
+  data           = d_full_vag_h,
+  panel          = FALSE,        # pregnancy-level repeated cross-sections
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+
+#summary(att_gt_full_fills)
+
+dyn_pool_fills <- aggte(
+  att_gt_full_fills,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3
+)
+
+summary(dyn_pool_fills)
+ ggdid(dyn_pool_fills)
+```
+
+
+## Cesearn 
+```{r}
+# step 9b C&S model outome mme per day 
+
+att_gt_full_mme <- att_gt(
+  yname          = "Y_mme",
+  gname          = "G",
+  idname         = "id",
+  tname          = "T",
+   xformla        = ~ age +any_comorbidity,
+  data           = d_full_ces_h,
+  panel          = FALSE,        # pregnancy-level repeated cross-sections
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+
+summary(att_gt_full_mme)
+
+dyn_pool_mme <- aggte(
+  att_gt_full_mme,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3,
+  na.rm = TRUE
+)
+
+ summary(dyn_pool_mme)
+ ggdid(dyn_pool_mme)
+```
+
+
+```{r}
+# step 9c C&S model outome opioid qunity
+
+att_gt_full_opquan <- att_gt(
+  yname          = "Y_op_quan",
+  gname          = "G",
+  idname         = "id",
+  tname          = "T",
+ #xformla        = ~  age +any_comorbidity,
+  data           = d_full_ces_h ,
+  panel          = FALSE,        # pregnancy-level repeated cross-sections
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+
+summary(att_gt_full_opquan)
+
+dyn_pool_opquan <- aggte(
+  att_gt_full_opquan,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3,
+  na.rm = TRUE
+)
+
+ summary(dyn_pool_opquan)
+ggdid(dyn_pool_opquan)
+```
+
+
+
+
+```{r}
+# step 9d C&S model outome days supply
+
+att_gt_full_dayssup <- att_gt(
+  yname          = "Y_dayssup",
+  gname          = "G",
+  idname         = "id",
+  tname          = "T",
+ # xformla        = ~ age +any_comorbidity,
+  data           = d_full_ces_h,
+  panel          = FALSE,        # pregnancy-level repeated cross-sections
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+
+#summary(att_gt_full_dayssup)
+
+dyn_pool_dayssup <- aggte(
+  att_gt_full_dayssup,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3,
+  na.rm = TRUE
+)
+
+ summary(dyn_pool_dayssup)
+ggdid(dyn_pool_dayssup)
+```
+
+```{r}
+# step 9e C&S model outome precription
+
+att_gt_full_fills <- att_gt(
+  yname          = "pp_fills_42d",
+  gname          = "G",
+  idname         = "id",
+  tname          = "T",
+ #xformla        = ~ age +any_comorbidity,
+  data           = d_full_ces,
+  panel          = FALSE,        # pregnancy-level repeated cross-sections
+  control_group  = "notyettreated",
+  clustervars    = "pat_state",
+  est_method     = "dr"
+)
+
+#summary(att_gt_full_fills)
+
+dyn_pool_fills <- aggte(
+  att_gt_full_fills,
+  type  = "dynamic",
+  min_e = -2,
+  max_e =  3,
+  na.rm = TRUE
+)
+
+summary(dyn_pool_fills)
+ ggdid(dyn_pool_fills)
+```
+
